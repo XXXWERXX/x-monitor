@@ -121,7 +121,13 @@ def _cookies_for_playwright(cookie_list: list) -> list[dict]:
 
 def fetch_tweets(screen_name: str) -> list[dict]:
     """用 Playwright 真浏览器抓取推文"""
-    log(f"启动浏览器抓取 @{screen_name}...")
+    return _fetch_with_playwright(screen_name, use_cookies=True) or _fetch_with_playwright(screen_name, use_cookies=False)
+
+
+def _fetch_with_playwright(screen_name: str, use_cookies: bool = True) -> list[dict]:
+    """Playwright 抓取核心"""
+    mode = "cookies模式" if use_cookies else "无cookies模式"
+    log(f"启动浏览器 ({mode}) ...")
 
     tweets = []
     proxy_config = None
@@ -130,7 +136,6 @@ def fetch_tweets(screen_name: str) -> list[dict]:
         proxy_config = {"server": proxy_str}
 
     with sync_playwright() as p:
-        # 启动 Chromium
         browser = p.chromium.launch(
             headless=True,
             args=[
@@ -153,11 +158,16 @@ def fetch_tweets(screen_name: str) -> list[dict]:
         )
 
         # 加载 cookies
-        cookies = _load_cookies_json()
-        if cookies:
-            pw_cookies = _cookies_for_playwright(cookies)
-            context.add_cookies(pw_cookies)
-            log(f"已注入 {len(pw_cookies)} 个 cookies")
+        if use_cookies:
+            cookies = _load_cookies_json()
+            if cookies:
+                pw_cookies = _cookies_for_playwright(cookies)
+                context.add_cookies(pw_cookies)
+                log(f"已注入 {len(pw_cookies)} 个 cookies")
+            else:
+                log("无 cookies 可用，跳过", "WARN")
+                browser.close()
+                return []
 
         page = context.new_page()
 
@@ -166,19 +176,28 @@ def fetch_tweets(screen_name: str) -> list[dict]:
             url = f"https://x.com/{screen_name}"
             log(f"访问 {url}")
 
-            page.goto(url, wait_until="networkidle", timeout=30000)
-            log(f"页面加载完成: {page.title()}")
+            # 用 domcontentloaded 而非 networkidle（X.com 有持续后台请求）
+            page.goto(url, wait_until="domcontentloaded", timeout=20000)
+            page_title = page.title()
+            log(f"页面标题: {page_title}")
 
-            # 等待推文出现
+            # 如果不是 X 页面，说明被拦截了
+            if "X" not in page_title and "Twitter" not in page_title and screen_name not in page_title:
+                log(f"页面标题异常: {page_title}", "WARN")
+
+            # 等待推文出现（X 用 JS 渲染，需要等一下）
+            page.wait_for_timeout(3000)
+
             try:
-                page.wait_for_selector('[data-testid="tweet"]', timeout=10000)
+                page.wait_for_selector('[data-testid="tweet"]', timeout=15000)
+                log("推文元素已加载")
             except PlaywrightTimeout:
-                # 如果等了10秒还没推文，截图看下
+                # 截图存证
                 page.screenshot(path=str(DATA_DIR / "debug_page.png"))
-                log("推文未出现，可能是被拦截或用户无推文", "WARN")
-                # 尝试获取页面内容看看
-                content = page.content()
-                debug(f"页面片段: {content[:2000]}")
+                log("推文未出现", "WARN")
+                # 打印页面文本看看
+                body_text = page.inner_text("body")[:500]
+                debug(f"页面文本: {body_text}")
                 browser.close()
                 return []
 
