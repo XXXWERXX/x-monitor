@@ -183,6 +183,48 @@ def _load_cookies_to_session(session: requests.Session) -> Optional[str]:
 
 # ── 动态获取 query ID ──
 
+def _extract_query_ids_from_html(html: str) -> dict:
+    """从 X 首页 HTML 中提取 GraphQL query IDs"""
+    query_ids = {}
+
+    # 方法1: 从 HTML 内嵌的 JS 中提取 queryId
+    # X 首页 HTML 中有类似: "queryId":"<id>","operationName":"UserByScreenName"
+    patterns = {
+        "UserByScreenName": r'"queryId":"([a-zA-Z0-9_\-]+)","operationName":"UserByScreenName"',
+        "UserTweets": r'"queryId":"([a-zA-Z0-9_\-]+)","operationName":"UserTweets"',
+    }
+
+    for name, pattern in patterns.items():
+        m = re.search(pattern, html)
+        if m:
+            query_ids[name] = m.group(1)
+            debug(f"提取 {name}: {m.group(1)}")
+
+    if query_ids:
+        log(f"动态提取 query IDs: {query_ids}")
+        return query_ids
+
+    # 方法2: 找 JS bundle URL 然后从里面提取
+    js_urls = re.findall(
+        r'(https://abs\.twimg\.com/responsive-web/client-web/main\.[a-f0-9]+\.js)',
+        html,
+    )
+    if js_urls:
+        try:
+            js_resp = requests.get(js_urls[0], timeout=15, headers={"User-Agent": USER_AGENT})
+            for name, pattern in patterns.items():
+                m = re.search(pattern, js_resp.text)
+                if m:
+                    query_ids[name] = m.group(1)
+            if query_ids:
+                log(f"从 JS bundle 提取 query IDs: {query_ids}")
+                return query_ids
+        except Exception as e:
+            log(f"下载 JS bundle 失败: {e}", "WARN")
+
+    return _fallback_query_ids()
+
+
 def _extract_query_ids(session: requests.Session) -> dict:
     """
     从 X 首页的 JS 源码中动态提取 GraphQL query ID。
@@ -405,55 +447,69 @@ def _parse_tweets(data: dict, screen_name: str) -> list[dict]:
 
 
 def fetch_tweets(screen_name: str, max_count: int = MAX_TWEETS) -> list[dict]:
-    """主抓取流程"""
+    """主抓取流程 — 先建立会话再抓取"""
     log(f"开始抓取 @{screen_name} ...")
 
     session = _session()
 
-    # 1. 动态提取 query IDs
-    query_ids = _extract_query_ids(session)
-
-    # 2. 加载 cookies / 获取 guest token
-    csrf_token = ""
-    guest_token = ""
+    # 1. 先加载 cookies
     auth_token = _load_cookies_to_session(session)
 
+    # 2. 获取 guest token 和 csrf token
+    guest_token = ""
+    csrf_token = ""
+
     if auth_token:
-        # 有 cookies: 用 auth_token 中的 ct0 做 CSRF
         for cookie in session.cookies:
             if cookie.name == "ct0":
                 csrf_token = cookie.value
                 break
-        # 如果 cookies 里没有 ct0，先访问首页获取
-        if not csrf_token:
-            try:
-                session.get("https://x.com/", timeout=15)
-                for cookie in session.cookies:
-                    if cookie.name == "ct0":
-                        csrf_token = cookie.value
-                        break
-            except Exception:
-                pass
         if not csrf_token:
             csrf_token = _random_csrf()
-            session.cookies.set("ct0", csrf_token, domain=".x.com")
-        log("使用已登录 cookies 模式")
+        log("使用 cookies 模式")
     else:
-        # 无 cookies: 用 guest token
-        csrf_token = _random_csrf()
         guest_token = _get_guest_token(session) or ""
-        session.cookies.set("ct0", csrf_token, domain=".x.com")
+        csrf_token = _random_csrf()
         log("使用访客模式")
 
-    # 3. 获取用户 ID
+    session.cookies.set("ct0", csrf_token, domain=".x.com")
+
+    # 3. 先访问首页建立会话（带上 cookies）
+    try:
+        home_resp = session.get(
+            "https://x.com/home",
+            headers={
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://x.com/",
+            },
+            timeout=15,
+        )
+        debug(f"首页 HTTP {home_resp.status_code}")
+        if home_resp.status_code == 200:
+            # 从首页 HTML 提取最新 query IDs
+            query_ids = _extract_query_ids_from_html(home_resp.text)
+        else:
+            query_ids = _fallback_query_ids()
+    except Exception as e:
+        log(f"访问首页失败: {e}", "WARN")
+        query_ids = _fallback_query_ids()
+
+    # 从首页 cookies 中尝试提取 ct0
+    for cookie in session.cookies:
+        if cookie.name == "ct0" and cookie.value:
+            csrf_token = cookie.value
+            debug(f"从首页获取 ct0: {csrf_token[:20]}...")
+
+    # 4. 获取用户 ID
     user_id = _get_user_id(session, screen_name, query_ids,
-                           guest_token or "", csrf_token)
+                           guest_token, csrf_token)
     if not user_id:
         log("无法获取用户 ID", "ERROR")
         session.close()
         return []
 
-    # 4. 获取推文
+    # 5. 获取推文
     data = _make_graphql_request(
         session,
         query_ids.get("UserTweets", _fallback_query_ids()["UserTweets"]),
@@ -466,22 +522,19 @@ def fetch_tweets(screen_name: str, max_count: int = MAX_TWEETS) -> list[dict]:
             "withVoice": True,
             "withV2Timeline": True,
         },
-        guest_token or "",
+        guest_token,
         csrf_token,
     )
 
-    # 如果主 query ID 失败，尝试备用
     if not data:
         alt_id = "JLApJKFY0MxGTzCoK6ps8Q"
         data = _make_graphql_request(
             session, alt_id, "UserTweets",
-            {
-                "userId": user_id, "count": max_count,
-                "includePromotedContent": False,
-                "withQuickPromoteEligibilityTweetFields": True,
-                "withVoice": True, "withV2Timeline": True,
-            },
-            guest_token or "", csrf_token,
+            {"userId": user_id, "count": max_count,
+             "includePromotedContent": False,
+             "withQuickPromoteEligibilityTweetFields": True,
+             "withVoice": True, "withV2Timeline": True},
+            guest_token, csrf_token,
         )
 
     session.close()
