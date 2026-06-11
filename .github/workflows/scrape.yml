@@ -35,18 +35,12 @@ jobs:
 
       - name: 🐦 运行推文监控
         env:
-          # ── 以下通过 GitHub Secrets 注入 ──
-          TARGET_SCREEN_NAME: ${{ secrets.TARGET_SCREEN_NAME || 'elonmusk' }}
+          TARGET_SCREEN_NAME: ${{ secrets.TARGET_SCREEN_NAME }}
           SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
           SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
           RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
           X_COOKIES: ${{ secrets.X_COOKIES }}
-
-          # ── 运行时参数 ──
           VERBOSE: "0"
-
-          # ── 可选的临时覆盖（workflow_dispatch） ──
-          ${{ github.event.inputs.target && format('TARGET_SCREEN_NAME: {0}', github.event.inputs.target) }}
         run: python main.py
 
       - name: 提交更新的状态文件
