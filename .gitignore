@@ -1,0 +1,16 @@
+# 本地配置文件（含敏感信息，不要提交）
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 运行时状态文件
+sent_tweets.json
+last_tweets.json
+x_cookies.json
+
+# IDE
+.vscode/
+.idea/

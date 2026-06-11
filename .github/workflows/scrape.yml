@@ -1,0 +1,73 @@
+name: X-Tweet-Monitor
+
+on:
+  schedule:
+    # 每30分钟运行一次
+    # GitHub Actions 免费额度: 2000分钟/月
+    # 每次约 1 分钟，每天48次 ≈ 1440分钟/月，在免费额度内
+    - cron: '*/30 * * * *'
+
+  # 允许手动触发（用于测试）
+  workflow_dispatch:
+    inputs:
+      target:
+        description: '临时目标用户名'
+        required: false
+        default: ''
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10  # 最多跑10分钟，防止卡死
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 设置 Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+
+      - name: 安装依赖
+        run: pip install -r requirements.txt
+
+      - name: 🐦 运行推文监控
+        env:
+          # ── 以下通过 GitHub Secrets 注入 ──
+          TARGET_SCREEN_NAME: ${{ secrets.TARGET_SCREEN_NAME || 'elonmusk' }}
+          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+          SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+          X_COOKIES: ${{ secrets.X_COOKIES }}
+
+          # ── 运行时参数 ──
+          VERBOSE: "0"
+
+          # ── 可选的临时覆盖（workflow_dispatch） ──
+          ${{ github.event.inputs.target && format('TARGET_SCREEN_NAME: {0}', github.event.inputs.target) }}
+        run: python main.py
+
+      - name: 提交更新的状态文件
+        if: success()
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add sent_tweets.json last_tweets.json 2>/dev/null || true
+          git diff --staged --quiet || git commit -m "📝 更新推文状态 [skip ci]"
+          git push || true
+
+      - name: ⚠️ 运行失败通知
+        if: failure()
+        env:
+          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+          SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+        run: |
+          python -c "
+          import os, sys
+          sys.path.insert(0, '.')
+          from main import send_error_notification
+          send_error_notification('GitHub Actions 运行失败，请检查仓库 Actions 日志。')
+          "
