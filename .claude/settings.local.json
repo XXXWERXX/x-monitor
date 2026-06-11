@@ -6,7 +6,8 @@
       "Bash(.venv/Scripts/python *)",
       "Bash(gh auth *)",
       "Bash(git *)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(.venv/Scripts/pip install *)"
     ]
   }
 }
