@@ -298,18 +298,21 @@ def _extract_tweet_from_element(el, page) -> Optional[dict]:
 # ══════════════════════════════════════════════
 
 def send_email(subject: str, html_body: str, to_email: str = "") -> bool:
-    recipient = to_email or RECIPIENT_EMAIL
+    """发送邮件，支持逗号分隔多个收件人"""
+    recipients_str = to_email or RECIPIENT_EMAIL
+    # 支持逗号分隔多个邮箱
+    recipients = [e.strip() for e in recipients_str.split(",") if e.strip()]
     sender = SENDER_EMAIL
     password = SENDER_PASSWORD
 
-    if not sender or not password or not recipient:
+    if not sender or not password or not recipients:
         log("邮件配置缺失", "ERROR")
         return False
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = sender
-    msg["To"] = recipient
+    msg["To"] = ", ".join(recipients)
     msg.attach(MIMEText(re.sub(r"<[^>]+>", "", html_body).strip(), "plain", "utf-8"))
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
@@ -323,7 +326,7 @@ def send_email(subject: str, html_body: str, to_email: str = "") -> bool:
                 s.ehlo(); s.starttls(); s.ehlo()
                 s.login(sender, password)
                 s.send_message(msg)
-        log(f"邮件已发送 -> {recipient}")
+        log(f"邮件已发送 -> {', '.join(recipients)}")
         return True
     except Exception as e:
         log(f"邮件失败: {e}", "ERROR")
