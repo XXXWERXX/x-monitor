@@ -1,30 +1,23 @@
 #!/usr/bin/env python3
 """
-X (Twitter) 推文监控 + 邮件转发
-========================================
-通过 X 公开 GraphQL API 抓取推文，QQ 邮箱转发。
-适配 2026 年 6 月 X 前端。
-
-原理: GitHub Actions 运行 → 获取 X guest token → 调用公开 API → 邮件通知
+X (Twitter) 推文监控 + 邮件转发（Playwright 真浏览器版）
+========================================================
+用 Playwright 启动真实 Chromium 浏览器访问 X.com，
+从页面 DOM 中提取推文，X 无法区分机器人和真人。
 """
 
 import argparse
 import json
 import os
-import random
 import re
 import smtplib
-import string
 import sys
-import time
 import traceback
 from datetime import datetime, timezone, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from pathlib import Path
 from typing import Optional
-
-import requests
 
 # ── Windows UTF-8 ──
 if sys.platform == "win32":
@@ -48,6 +41,8 @@ def _load_dotenv():
                 os.environ[key] = value
 
 _load_dotenv()
+
+from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
 
 # ══════════════════════════════════════════════
 #  配置
@@ -82,474 +77,205 @@ def debug(msg: str) -> None:
 
 
 # ══════════════════════════════════════════════
-#  HTTP 请求基础
+#  Playwright 浏览器抓取
 # ══════════════════════════════════════════════
 
-USER_AGENT = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/126.0.0.0 Safari/537.36"
-)
-
-
-def _base_headers() -> dict:
-    return {
-        "User-Agent": USER_AGENT,
-        "Accept": "*/*",
-        "Accept-Language": "zh-CN,zh;q=0.9",
-        "Origin": "https://x.com",
-        "Referer": "https://x.com/",
-        "Sec-Fetch-Site": "same-origin",
-    }
-
-
-def _proxy() -> Optional[dict]:
-    p = HTTPS_PROXY or HTTP_PROXY or None
-    if p:
-        return {"https": p, "http": p}
-    return None
-
-
-def _session() -> requests.Session:
-    s = requests.Session()
-    s.headers.update(_base_headers())
-    if _proxy():
-        s.proxies.update(_proxy())
-    return s
-
-
-def _random_csrf() -> str:
-    """生成随机 32 位 hex csrf token（X 接受任意 32 位 hex）"""
-    return "".join(random.choices("0123456789abcdef", k=32))
-
-
-# ══════════════════════════════════════════════
-#  X 公开 API 抓取
-# ══════════════════════════════════════════════
-
-def _get_guest_token(session: requests.Session) -> Optional[str]:
-    """获取 X guest token（公开 API，无需登录）"""
-    try:
-        # X 的公开激活接口
-        headers = {
-            "Authorization": "Bearer AAAAAAAAAAAAAAAAAAAAANRILgAAAAAAnNwIzUejRCOuH5E6I8xnZz4puTs%3D1Zv7ttfk8LF81IUq16cHjhLTvJu4FA33AGWWjCpTnA",
-            "Content-Type": "application/x-www-form-urlencoded",
-        }
-        resp = session.post(
-            "https://api.x.com/1.1/guest/activate.json",
-            headers=headers,
-            timeout=15,
-        )
-        if resp.status_code == 200:
-            token = resp.json().get("guest_token", "")
-            if token:
-                log(f"获取 guest token: {token[:10]}...")
-                return token
-        log(f"获取 guest token 失败 (HTTP {resp.status_code})", "WARN")
-    except Exception as e:
-        log(f"获取 guest token 异常: {e}", "WARN")
-    return None
-
-
-def _load_cookies_to_session(session: requests.Session) -> Optional[str]:
-    """加载 cookies 到 session，返回 auth_token"""
-    cookie_list = None
-
+def _load_cookies_json() -> Optional[list]:
+    """加载 cookies JSON"""
     env_cookies = os.getenv("X_COOKIES", "")
     if env_cookies:
         try:
-            cookie_list = json.loads(env_cookies)
+            return json.loads(env_cookies)
         except json.JSONDecodeError:
             pass
-
-    if cookie_list is None and COOKIES_FILE.exists():
+    if COOKIES_FILE.exists():
         try:
-            cookie_list = json.loads(COOKIES_FILE.read_text(encoding="utf-8"))
+            return json.loads(COOKIES_FILE.read_text(encoding="utf-8"))
         except (json.JSONDecodeError, KeyError):
-            pass
-
-    if not cookie_list:
-        return None
-
-    auth_token = None
-    for c in cookie_list:
-        session.cookies.set(c["name"], c["value"], domain=c.get("domain", ""))
-        if c["name"] == "auth_token":
-            auth_token = c["value"]
-
-    log(f"加载 {len(cookie_list)} 个 cookies" + (", 含 auth_token" if auth_token else ""))
-    return auth_token
-
-
-# ── 动态获取 query ID ──
-
-def _extract_query_ids_from_html(html: str) -> dict:
-    """从 X 首页 HTML 中提取 GraphQL query IDs"""
-    query_ids = {}
-
-    # 方法1: 从 HTML 内嵌的 JS 中提取 queryId
-    # X 首页 HTML 中有类似: "queryId":"<id>","operationName":"UserByScreenName"
-    patterns = {
-        "UserByScreenName": r'"queryId":"([a-zA-Z0-9_\-]+)","operationName":"UserByScreenName"',
-        "UserTweets": r'"queryId":"([a-zA-Z0-9_\-]+)","operationName":"UserTweets"',
-    }
-
-    for name, pattern in patterns.items():
-        m = re.search(pattern, html)
-        if m:
-            query_ids[name] = m.group(1)
-            debug(f"提取 {name}: {m.group(1)}")
-
-    if query_ids:
-        log(f"动态提取 query IDs: {query_ids}")
-        return query_ids
-
-    # 方法2: 找 JS bundle URL 然后从里面提取
-    js_urls = re.findall(
-        r'(https://abs\.twimg\.com/responsive-web/client-web/main\.[a-f0-9]+\.js)',
-        html,
-    )
-    if js_urls:
-        try:
-            js_resp = requests.get(js_urls[0], timeout=15, headers={"User-Agent": USER_AGENT})
-            for name, pattern in patterns.items():
-                m = re.search(pattern, js_resp.text)
-                if m:
-                    query_ids[name] = m.group(1)
-            if query_ids:
-                log(f"从 JS bundle 提取 query IDs: {query_ids}")
-                return query_ids
-        except Exception as e:
-            log(f"下载 JS bundle 失败: {e}", "WARN")
-
-    return _fallback_query_ids()
-
-
-def _extract_query_ids(session: requests.Session) -> dict:
-    """
-    从 X 首页的 JS 源码中动态提取 GraphQL query ID。
-    这样每次运行都自动适配最新接口。
-    """
-    try:
-        # 获取 X 首页 HTML
-        resp = session.get("https://x.com/", timeout=15)
-        html = resp.text
-
-        # 找主 JS bundle URL: main.<hash>.js
-        js_urls = re.findall(
-            r'src="(https://abs\.twimg\.com/responsive-web/client-web/[^"]+\.js)"',
-            html,
-        )
-        if not js_urls:
-            js_urls = re.findall(
-                r'(https://abs\.twimg\.com/responsive-web/client-web/main\.[a-f0-9]+\.js)',
-                html,
-            )
-        if not js_urls:
-            # 备用: 匹配任何 abs.twimg.com JS
-            js_urls = re.findall(
-                r'(https://abs\.twimg\.com/responsive-web/[^"]+\.js)',
-                html,
-            )
-
-        if not js_urls:
-            log("未找到 X JS bundle URL", "WARN")
-            return _fallback_query_ids()
-
-        # 下载 JS bundle
-        js_url = js_urls[0]
-        debug(f"JS bundle: {js_url}")
-        js_resp = session.get(js_url, timeout=15)
-        js_text = js_resp.text
-
-        # 提取 query IDs: "queryId":"<id>","operationName":"UserByScreenName"
-        query_ids = {}
-
-        patterns = {
-            "UserByScreenName": r'"queryId":"([a-zA-Z0-9_\-]+)"[^}]*"operationName":"UserByScreenName"',
-            "UserTweets": r'"queryId":"([a-zA-Z0-9_\-]+)"[^}]*"operationName":"UserTweets"',
-        }
-
-        for name, pattern in patterns.items():
-            m = re.search(pattern, js_text)
-            if m:
-                query_ids[name] = m.group(1)
-                debug(f"找到 {name}: {m.group(1)}")
-
-        if query_ids:
-            log(f"动态提取 query IDs: {query_ids}")
-            return query_ids
-
-    except Exception as e:
-        log(f"提取 query IDs 失败: {e}", "WARN")
-
-    return _fallback_query_ids()
-
-
-def _fallback_query_ids() -> dict:
-    """当动态提取失败时的硬编码备选"""
-    return {
-        "UserByScreenName": "32pL5BWe9WKeSK1MoPvFQQ",
-        "UserTweets": "Y9WM4Id6UcGFE8Z-hbnixw",
-    }
-
-
-# ── API 调用 ──
-
-def _make_graphql_request(
-    session: requests.Session,
-    query_id: str,
-    operation_name: str,
-    variables: dict,
-    guest_token: str = "",
-    csrf_token: str = "",
-) -> Optional[dict]:
-    """调用 X GraphQL API"""
-    url = f"https://x.com/i/api/graphql/{query_id}/{operation_name}"
-    params = {
-        "variables": json.dumps(variables, separators=(",", ":")),
-        "features": json.dumps({
-            "responsive_web_graphql_exclude_directive_enabled": True,
-            "verified_phone_label_enabled": False,
-            "responsive_web_graphql_skip_user_profile_image_extensions_enabled": False,
-            "responsive_web_graphql_timeline_navigation_enabled": True,
-            "responsive_web_enhance_cards_enabled": False,
-        }, separators=(",", ":")),
-    }
-
-    headers = {
-        "Content-Type": "application/json",
-        "x-twitter-active-user": "yes",
-        "x-twitter-client-language": "en",
-    }
-
-    if guest_token:
-        headers["x-guest-token"] = guest_token
-    if csrf_token:
-        headers["x-csrf-token"] = csrf_token
-        # 添加随机 CSRF cookie（X 要求的）
-        if "ct0" not in session.cookies:
-            session.cookies.set("ct0", csrf_token, domain=".x.com")
-
-    try:
-        resp = session.get(url, params=params, headers=headers, timeout=20)
-        debug(f"{operation_name} HTTP {resp.status_code}")
-
-        if resp.status_code == 429:
-            log(f"速率限制 ({operation_name})，等待 60 秒...", "WARN")
-            time.sleep(60)
-            return None
-        if resp.status_code == 403:
-            log(f"HTTP 403 ({operation_name})", "WARN")
-            return None
-        if resp.status_code != 200:
-            log(f"HTTP {resp.status_code} ({operation_name}): {resp.text[:300]}", "ERROR")
-            return None
-
-        return resp.json()
-
-    except Exception as e:
-        log(f"API 请求失败 ({operation_name}): {e}", "ERROR")
-        return None
-
-
-def _get_user_id(session: requests.Session, screen_name: str,
-                 query_ids: dict, guest_token: str, csrf_token: str) -> Optional[str]:
-    """通过用户名获取 user ID"""
-    data = _make_graphql_request(
-        session,
-        query_ids["UserByScreenName"],
-        "UserByScreenName",
-        {"screen_name": screen_name, "withSafetyModeUserFields": True},
-        guest_token,
-        csrf_token,
-    )
-    if not data:
-        # 尝试备用 ID
-        alt_id = "u7wQyGi6oExe8_TRWGMq4Q"
-        data = _make_graphql_request(
-            session,
-            alt_id,
-            "UserByScreenName",
-            {"screen_name": screen_name, "withSafetyModeUserFields": True},
-            guest_token,
-            csrf_token,
-        )
-
-    if data:
-        try:
-            user_result = data.get("data", {}).get("user", {}).get("result", {})
-            rest_id = user_result.get("rest_id", "")
-            if rest_id:
-                log(f"用户 @{screen_name} ID: {rest_id}")
-                return rest_id
-        except Exception:
             pass
     return None
 
 
-def _parse_tweets(data: dict, screen_name: str) -> list[dict]:
-    """解析推文响应"""
+def _cookies_for_playwright(cookie_list: list) -> list[dict]:
+    """将 Cookie-Editor 格式转为 Playwright 格式"""
+    result = []
+    for c in cookie_list:
+        pw_cookie = {
+            "name": c["name"],
+            "value": c["value"],
+            "domain": c.get("domain", ".x.com"),
+            "path": c.get("path", "/"),
+        }
+        # Playwright 需要 httpOnly 和 secure
+        if c.get("httpOnly"):
+            pw_cookie["httpOnly"] = True
+        if c.get("secure"):
+            pw_cookie["secure"] = True
+        # sameSite
+        same_site = c.get("sameSite", "")
+        if same_site and same_site != "no_restriction":
+            pw_cookie["sameSite"] = same_site.replace("_", "").title()
+        result.append(pw_cookie)
+    return result
+
+
+def fetch_tweets(screen_name: str) -> list[dict]:
+    """用 Playwright 真浏览器抓取推文"""
+    log(f"启动浏览器抓取 @{screen_name}...")
+
     tweets = []
-    try:
-        result = data.get("data", {}).get("user", {}).get("result", {})
-        timeline = result.get("timeline_v2", {}).get("timeline", {})
-        instructions = timeline.get("instructions", [])
+    proxy_config = None
+    proxy_str = HTTPS_PROXY or HTTP_PROXY or ""
+    if proxy_str:
+        proxy_config = {"server": proxy_str}
 
-        for instr in instructions:
-            if instr.get("type") not in ("TimelineAddEntries",):
-                continue
-            for entry in instr.get("entries", []):
-                eid = entry.get("entryId", "")
-                if eid.startswith(("cursor-", "who-to-follow", "user-", "prompt-")):
-                    continue
+    with sync_playwright() as p:
+        # 启动 Chromium
+        browser = p.chromium.launch(
+            headless=True,
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+            ],
+            proxy=proxy_config if proxy_config else None,
+        )
 
-                content = entry.get("content", {})
-                item = content.get("itemContent", {}) or content.get("items", [{}])
-                if isinstance(item, list):
-                    if not item:
-                        continue
-                    item = item[0].get("item", {}).get("itemContent", {})
+        context = browser.new_context(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/126.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1280, "height": 800},
+            locale="en-US",
+        )
 
-                tweet_res = item.get("tweet_results", {}).get("result", {})
-                if tweet_res.get("__typename") == "TweetWithVisibilityResults":
-                    tweet_res = tweet_res.get("tweet", {})
+        # 加载 cookies
+        cookies = _load_cookies_json()
+        if cookies:
+            pw_cookies = _cookies_for_playwright(cookies)
+            context.add_cookies(pw_cookies)
+            log(f"已注入 {len(pw_cookies)} 个 cookies")
 
-                legacy = tweet_res.get("legacy", {})
-                if not legacy:
-                    continue
+        page = context.new_page()
 
-                core = tweet_res.get("core", {})
-                user_legacy = (
-                    core.get("user_results", {}).get("result", {}).get("legacy", {})
-                )
+        try:
+            # 访问用户主页
+            url = f"https://x.com/{screen_name}"
+            log(f"访问 {url}")
 
-                tid = legacy.get("id_str", "") or tweet_res.get("rest_id", "")
-                tweets.append({
-                    "id": tid,
-                    "created_at": legacy.get("created_at", ""),
-                    "full_text": legacy.get("full_text", ""),
-                    "favorite_count": legacy.get("favorite_count", 0),
-                    "retweet_count": legacy.get("retweet_count", 0),
-                    "reply_count": legacy.get("reply_count", 0),
-                    "quote_count": legacy.get("quote_count", 0),
-                    "view_count": legacy.get("views", {}).get("count", "N/A"),
-                    "author_name": user_legacy.get("name", screen_name),
-                    "author_screen_name": user_legacy.get("screen_name", screen_name),
-                    "url": f"https://x.com/{user_legacy.get('screen_name', screen_name)}/status/{tid}",
-                })
+            page.goto(url, wait_until="networkidle", timeout=30000)
+            log(f"页面加载完成: {page.title()}")
 
-    except Exception as e:
-        log(f"解析推文出错: {e}", "ERROR")
-        debug(traceback.format_exc())
+            # 等待推文出现
+            try:
+                page.wait_for_selector('[data-testid="tweet"]', timeout=10000)
+            except PlaywrightTimeout:
+                # 如果等了10秒还没推文，截图看下
+                page.screenshot(path=str(DATA_DIR / "debug_page.png"))
+                log("推文未出现，可能是被拦截或用户无推文", "WARN")
+                # 尝试获取页面内容看看
+                content = page.content()
+                debug(f"页面片段: {content[:2000]}")
+                browser.close()
+                return []
 
+            # 滚动几次加载更多推文
+            for _ in range(3):
+                page.evaluate("window.scrollBy(0, 800)")
+                page.wait_for_timeout(1000)
+
+            # 提取推文
+            tweet_elements = page.query_selector_all('[data-testid="tweet"]')
+            log(f"找到 {len(tweet_elements)} 个推文元素")
+
+            for el in tweet_elements[:MAX_TWEETS]:
+                try:
+                    tweet_data = _extract_tweet_from_element(el, page)
+                    if tweet_data:
+                        tweets.append(tweet_data)
+                except Exception as e:
+                    debug(f"提取单条推文失败: {e}")
+
+        except PlaywrightTimeout:
+            log("页面加载超时", "ERROR")
+            try:
+                page.screenshot(path=str(DATA_DIR / "debug_timeout.png"))
+            except Exception:
+                pass
+        except Exception as e:
+            log(f"浏览器抓取失败: {e}", "ERROR")
+            debug(traceback.format_exc())
+            try:
+                page.screenshot(path=str(DATA_DIR / "debug_error.png"))
+            except Exception:
+                pass
+        finally:
+            browser.close()
+
+    log(f"共提取 {len(tweets)} 条推文")
     return tweets
 
 
-def fetch_tweets(screen_name: str, max_count: int = MAX_TWEETS) -> list[dict]:
-    """主抓取流程 — 先建立会话再抓取"""
-    log(f"开始抓取 @{screen_name} ...")
+def _extract_tweet_from_element(el, page) -> Optional[dict]:
+    """从推文 DOM 元素提取数据"""
+    # 提取推文链接 (含 ID)
+    links = el.query_selector_all('a[href*="/status/"]')
+    tid = ""
+    tweet_url = ""
+    for link in links:
+        href = link.get_attribute("href") or ""
+        m = re.search(r"/status/(\d+)", href)
+        if m:
+            tid = m.group(1)
+            tweet_url = f"https://x.com{href.split('?')[0]}"
+            break
 
-    session = _session()
+    if not tid:
+        return None
 
-    # 1. 先加载 cookies
-    auth_token = _load_cookies_to_session(session)
+    # 提取推文文本
+    text = ""
+    text_el = el.query_selector('[data-testid="tweetText"]')
+    if text_el:
+        text = text_el.inner_text()
 
-    # 2. 获取 guest token 和 csrf token
-    guest_token = ""
-    csrf_token = ""
+    # 提取时间
+    time_el = el.query_selector("time")
+    created_at = ""
+    if time_el:
+        created_at = time_el.get_attribute("datetime") or ""
 
-    if auth_token:
-        for cookie in session.cookies:
-            if cookie.name == "ct0":
-                csrf_token = cookie.value
-                break
-        if not csrf_token:
-            csrf_token = _random_csrf()
-        log("使用 cookies 模式")
-    else:
-        guest_token = _get_guest_token(session) or ""
-        csrf_token = _random_csrf()
-        log("使用访客模式")
+    # 提取互动数据
+    def _get_count(label: str) -> int:
+        """从 aria-label 中提取数字"""
+        el_sel = el.query_selector(f'[data-testid="{label}"]')
+        if el_sel:
+            aria = el_sel.get_attribute("aria-label") or ""
+            m = re.search(r"(\d[\d,]*)", aria)
+            if m:
+                return int(m.group(1).replace(",", ""))
+        return 0
 
-    session.cookies.set("ct0", csrf_token, domain=".x.com")
-
-    # 3. 先访问首页建立会话（带上 cookies）
-    try:
-        home_resp = session.get(
-            "https://x.com/home",
-            headers={
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Referer": "https://x.com/",
-            },
-            timeout=15,
-        )
-        debug(f"首页 HTTP {home_resp.status_code}")
-        if home_resp.status_code == 200:
-            # 从首页 HTML 提取最新 query IDs
-            query_ids = _extract_query_ids_from_html(home_resp.text)
-        else:
-            query_ids = _fallback_query_ids()
-    except Exception as e:
-        log(f"访问首页失败: {e}", "WARN")
-        query_ids = _fallback_query_ids()
-
-    # 从首页 cookies 中尝试提取 ct0
-    for cookie in session.cookies:
-        if cookie.name == "ct0" and cookie.value:
-            csrf_token = cookie.value
-            debug(f"从首页获取 ct0: {csrf_token[:20]}...")
-
-    # 4. 获取用户 ID
-    user_id = _get_user_id(session, screen_name, query_ids,
-                           guest_token, csrf_token)
-    if not user_id:
-        log("无法获取用户 ID", "ERROR")
-        session.close()
-        return []
-
-    # 5. 获取推文
-    data = _make_graphql_request(
-        session,
-        query_ids.get("UserTweets", _fallback_query_ids()["UserTweets"]),
-        "UserTweets",
-        {
-            "userId": user_id,
-            "count": max_count,
-            "includePromotedContent": False,
-            "withQuickPromoteEligibilityTweetFields": True,
-            "withVoice": True,
-            "withV2Timeline": True,
-        },
-        guest_token,
-        csrf_token,
-    )
-
-    if not data:
-        alt_id = "JLApJKFY0MxGTzCoK6ps8Q"
-        data = _make_graphql_request(
-            session, alt_id, "UserTweets",
-            {"userId": user_id, "count": max_count,
-             "includePromotedContent": False,
-             "withQuickPromoteEligibilityTweetFields": True,
-             "withVoice": True, "withV2Timeline": True},
-            guest_token, csrf_token,
-        )
-
-    session.close()
-
-    if not data:
-        log("无法获取推文数据", "ERROR")
-        return []
-
-    tweets = _parse_tweets(data, screen_name)
-    log(f"抓取到 {len(tweets)} 条推文")
-    return tweets
+    return {
+        "id": tid,
+        "created_at": created_at,
+        "full_text": text,
+        "favorite_count": _get_count("like"),
+        "retweet_count": _get_count("retweet"),
+        "reply_count": _get_count("reply"),
+        "quote_count": 0,
+        "view_count": "N/A",
+        "author_name": TARGET_SCREEN_NAME,
+        "author_screen_name": TARGET_SCREEN_NAME,
+        "url": tweet_url or f"https://x.com/{TARGET_SCREEN_NAME}/status/{tid}",
+    }
 
 
 # ══════════════════════════════════════════════
-#  邮件发送
+#  邮件
 # ══════════════════════════════════════════════
 
 def send_email(subject: str, html_body: str, to_email: str = "") -> bool:
@@ -558,15 +284,14 @@ def send_email(subject: str, html_body: str, to_email: str = "") -> bool:
     password = SENDER_PASSWORD
 
     if not sender or not password or not recipient:
-        log("邮件配置缺失 (SENDER_EMAIL/SENDER_PASSWORD/RECIPIENT_EMAIL)", "ERROR")
+        log("邮件配置缺失", "ERROR")
         return False
 
     msg = MIMEMultipart("alternative")
     msg["Subject"] = subject
     msg["From"] = sender
     msg["To"] = recipient
-    plain = re.sub(r"<[^>]+>", "", html_body).strip()
-    msg.attach(MIMEText(plain, "plain", "utf-8"))
+    msg.attach(MIMEText(re.sub(r"<[^>]+>", "", html_body).strip(), "plain", "utf-8"))
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
     try:
@@ -579,18 +304,11 @@ def send_email(subject: str, html_body: str, to_email: str = "") -> bool:
                 s.ehlo(); s.starttls(); s.ehlo()
                 s.login(sender, password)
                 s.send_message(msg)
-        log(f"邮件发送成功 -> {recipient}")
+        log(f"邮件已发送 -> {recipient}")
         return True
     except Exception as e:
-        log(f"邮件发送失败: {e}", "ERROR")
+        log(f"邮件失败: {e}", "ERROR")
         return False
-
-
-def send_error_notification(err: str) -> None:
-    send_email(
-        f"[X监控] 脚本异常 - {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-        f"<h2>异常</h2><p>{datetime.now()}</p><pre>{err[:2000]}</pre>",
-    )
 
 
 # ══════════════════════════════════════════════
@@ -601,19 +319,17 @@ def load_sent() -> set[str]:
     if SENT_TWEETS_FILE.exists():
         try:
             data = json.loads(SENT_TWEETS_FILE.read_text(encoding="utf-8"))
-            ids = data.get("tweet_ids", []) if isinstance(data, dict) else data
-            return set(ids[-500:])
+            return set((data.get("tweet_ids", []) if isinstance(data, dict) else data)[-500:])
         except Exception:
             pass
     return set()
 
 
 def save_sent(ids: set[str]) -> None:
-    SENT_TWEETS_FILE.write_text(
-        json.dumps({"tweet_ids": list(ids)[-500:], "last_updated": datetime.now(timezone.utc).isoformat()},
-                   ensure_ascii=False, indent=2),
-        encoding="utf-8",
-    )
+    SENT_TWEETS_FILE.write_text(json.dumps({
+        "tweet_ids": list(ids)[-500:],
+        "last_updated": datetime.now(timezone.utc).isoformat(),
+    }, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def deduplicate(tweets: list[dict]) -> list[dict]:
@@ -626,7 +342,7 @@ def deduplicate(tweets: list[dict]) -> list[dict]:
             sent.add(tid)
     if new_list:
         save_sent(sent)
-        log(f"{len(new_list)} 条新推文 / {len(tweets)} 条总量")
+        log(f"{len(new_list)} 条新 / {len(tweets)} 条总")
     else:
         log("无新推文")
     return new_list
@@ -637,32 +353,33 @@ def deduplicate(tweets: list[dict]) -> list[dict]:
 # ══════════════════════════════════════════════
 
 def build_email(tweets: list[dict], target: str) -> str:
+    utc8 = timezone(timedelta(hours=8))
     cards = ""
     for t in tweets:
         text = (t.get("full_text") or "").replace("&", "&amp;").replace("<", "&lt;").replace("\n", "<br>")
         text = re.sub(r'(https?://\S+)', r'<a href="\1" style="color:#1d9bf0;">\1</a>', text)
+        ts = (t.get("created_at") or "")[:19]
         cards += f"""
-        <div style="margin-bottom:16px;padding:16px;border:1px solid #e1e8ed;border-radius:12px;background:#fff;">
-            <div style="font-size:15px;line-height:1.6;color:#0f1419;margin-bottom:8px;">{text}</div>
-            <div style="font-size:12px;color:#536471;">{t.get('created_at', '')[:19]}</div>
+        <div style="margin-bottom:14px;padding:14px;border:1px solid #e1e8ed;border-radius:12px;background:#fff;">
+            <div style="font-size:15px;line-height:1.5;color:#0f1419;margin-bottom:6px;">{text}</div>
+            <div style="font-size:12px;color:#536471;">{ts}</div>
             <div style="font-size:12px;color:#536471;margin-top:4px;">
                 💬{t.get('reply_count',0):,} 🔁{t.get('retweet_count',0):,} ❤️{t.get('favorite_count',0):,}
             </div>
             <div style="margin-top:8px;">
-                <a href="{t.get('url','#')}" style="display:inline-block;padding:6px 14px;background:#1d9bf0;color:#fff;text-decoration:none;border-radius:20px;font-size:12px;">查看原文</a>
+                <a href="{t.get('url','#')}" style="display:inline-block;padding:5px 14px;background:#1d9bf0;color:#fff;text-decoration:none;border-radius:20px;font-size:12px;">查看原文</a>
             </div>
         </div>"""
-
     return f"""
-    <html><body style="margin:0;padding:20px;background:#f7f9fa;font-family:-apple-system,sans-serif;">
+    <html><body style="margin:0;padding:18px;background:#f7f9fa;font-family:-apple-system,sans-serif;">
     <div style="max-width:600px;margin:0 auto;">
-        <div style="background:#1d9bf0;padding:20px 24px;border-radius:12px 12px 0 0;color:#fff;">
+        <div style="background:#1d9bf0;padding:18px 24px;border-radius:12px 12px 0 0;color:#fff;">
             <h2 style="margin:0;">X 推文提醒</h2>
-            <p style="margin:4px 0 0;font-size:14px;">@{target} · {len(tweets)} 条新推文</p>
+            <p style="margin:4px 0 0;font-size:13px;">@{target} · {len(tweets)} 条新推文</p>
         </div>
-        <div style="background:#fff;padding:20px;border:1px solid #e1e8ed;">{cards}</div>
-        <div style="background:#f7f9fa;padding:12px;text-align:center;font-size:11px;color:#8899a6;border:1px solid #e1e8ed;border-radius:0 0 12px 12px;">
-            X Monitor Bot · GitHub Actions · 免费运行
+        <div style="background:#fff;padding:18px;border:1px solid #e1e8ed;">{cards}</div>
+        <div style="background:#f7f9fa;padding:10px;text-align:center;font-size:11px;color:#8899a6;border:1px solid #e1e8ed;border-radius:0 0 12px 12px;">
+            X Monitor Bot · GitHub Actions · 免费
         </div>
     </div></body></html>"""
 
@@ -673,22 +390,17 @@ def build_email(tweets: list[dict], target: str) -> str:
 
 def check_and_notify() -> dict:
     summary = {"target": TARGET_SCREEN_NAME, "fetched": 0, "new": 0, "email_sent": False}
-
     tweets = fetch_tweets(TARGET_SCREEN_NAME)
     summary["fetched"] = len(tweets)
-
     if tweets:
         tweets.sort(key=lambda t: t.get("id", ""), reverse=True)
-
     new_tweets = deduplicate(tweets)
     summary["new"] = len(new_tweets)
-
     if new_tweets:
         html = build_email(new_tweets, TARGET_SCREEN_NAME)
         subject = f"[X监控] @{TARGET_SCREEN_NAME} 发布了 {len(new_tweets)} 条新推文"
         if send_email(subject, html):
             summary["email_sent"] = True
-
     return summary
 
 
@@ -696,16 +408,15 @@ def interactive_login():
     print("\n" + "=" * 60)
     print("  X Cookies 获取向导")
     print("=" * 60)
-    print("1. 浏览器登录 https://x.com\n2. Cookie-Editor 插件导出 JSON\n3. 粘贴到下方\n")
+    print("1. 浏览器登录 https://x.com\n2. Cookie-Editor 导出 JSON\n3. 粘贴到下方\n")
     lines = []
     try:
         while True:
             lines.append(input())
     except (EOFError, KeyboardInterrupt):
         pass
-    raw = "\n".join(lines)
     try:
-        cookies = json.loads(raw)
+        cookies = json.loads("\n".join(lines))
         if isinstance(cookies, dict):
             cookies = [cookies]
         COOKIES_FILE.write_text(json.dumps(cookies, indent=2, ensure_ascii=False), encoding="utf-8")
@@ -715,10 +426,9 @@ def interactive_login():
 
 
 def main():
-    parser = argparse.ArgumentParser(description="X 推文监控 + 邮件转发")
+    parser = argparse.ArgumentParser(description="X 推文监控 + 邮件转发 (Playwright版)")
     parser.add_argument("--login", action="store_true", help="获取 cookies")
     parser.add_argument("--test-email", action="store_true", help="测试邮件")
-    parser.add_argument("--startup", action="store_true", help="启动通知")
     parser.add_argument("--verbose", "-v", action="store_true", help="详细日志")
     parser.add_argument("--target", type=str, default="", help="临时目标")
     args = parser.parse_args()
@@ -734,24 +444,17 @@ def main():
         return
     if args.test_email:
         print("测试邮件...")
-        ok = send_email("[X监控] 测试", f"<h2>测试</h2><p>目标: @{TARGET_SCREEN_NAME}</p><p>{datetime.now()}</p>")
+        ok = send_email("[X监控] 测试", f"<h2>测试</h2><p>@{TARGET_SCREEN_NAME}</p><p>{datetime.now()}</p>")
         print("成功!" if ok else "失败!")
         return
-    if args.startup:
-        send_email(f"[X监控] 启动 - @{TARGET_SCREEN_NAME}", f"<h2>监控已启动</h2><p>@{TARGET_SCREEN_NAME}</p>")
-        return
 
-    print(f"\n{'='*50}\n  X 推文监控\n  目标: @{TARGET_SCREEN_NAME}\n{'='*50}\n")
+    print(f"\n{'='*50}\n  X 推文监控 (Playwright)\n  目标: @{TARGET_SCREEN_NAME}\n{'='*50}\n")
     try:
         r = check_and_notify()
         print("\n" + json.dumps(r, ensure_ascii=False, indent=2))
     except Exception as e:
         err = f"{type(e).__name__}: {e}\n{traceback.format_exc()}"
         log(err, "ERROR")
-        try:
-            send_error_notification(err)
-        except Exception:
-            pass
         sys.exit(1)
 
 

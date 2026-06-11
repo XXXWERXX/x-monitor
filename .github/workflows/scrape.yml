@@ -18,7 +18,7 @@ on:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 10  # 最多跑10分钟，防止卡死
+    timeout-minutes: 15  # Playwright 需要更多时间
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
@@ -33,7 +33,10 @@ jobs:
           cache: 'pip'
 
       - name: 安装依赖
-        run: pip install -r requirements.txt
+        run: |
+          pip install -r requirements.txt
+          playwright install chromium
+          playwright install-deps chromium
 
       - name: 🐦 运行推文监控
         env:
