@@ -19,6 +19,8 @@ jobs:
   monitor:
     runs-on: ubuntu-latest
     timeout-minutes: 10  # 最多跑10分钟，防止卡死
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
     steps:
       - name: 检出代码

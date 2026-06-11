@@ -5,7 +5,8 @@
       "Bash(python *)",
       "Bash(.venv/Scripts/python *)",
       "Bash(gh auth *)",
-      "Bash(git *)"
+      "Bash(git *)",
+      "WebSearch"
     ]
   }
 }

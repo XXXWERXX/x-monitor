@@ -87,9 +87,13 @@ VERBOSE = os.getenv("VERBOSE", "0") == "1"
 # ──────────────────────────────────────────────
 
 # 获取用户信息的 GraphQL query ID
-USER_BY_SCREEN_NAME_QUERY_ID = "qRednkZG1C17S1bRaVkaOA"
+USER_BY_SCREEN_NAME_QUERY_ID = "32pL5BWe9WKeSK1MoPvFQQ"
 # 获取用户推文的 GraphQL query ID (UserTweets)
-USER_TWEETS_QUERY_ID = "V7H0jFSMyp4gzwGJhLG75g"
+USER_TWEETS_QUERY_ID = "Y9WM4Id6UcGFE8Z-hbnixw"
+
+# 备用 query IDs（如果主 ID 失效）
+ALT_USER_BY_SCREEN_NAME_QUERY_ID = "u7wQyGi6oExe8_TRWGMq4Q"
+ALT_USER_TWEETS_QUERY_ID = "JLApJKFY0MxGTzCoK6ps8Q"
 
 # 这些是 X 网页版的标准 feature switches，需要和浏览器一致
 X_FEATURES = {
@@ -135,65 +139,78 @@ def debug(msg: str) -> None:
 #  X / Twitter 爬虫模块
 # ════════════════════════════════════════════════
 
-def _build_client() -> httpx.Client:
+def _build_client(extra_headers: dict = None) -> httpx.Client:
     """构建带浏览器伪装头的 httpx 客户端"""
     proxy = HTTPS_PROXY or HTTP_PROXY or None
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/125.0.0.0 Safari/537.36"
+        ),
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
+        "Accept": "application/json, text/plain, */*",
+        "Referer": "https://x.com/",
+        "Origin": "https://x.com",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "same-origin",
+        "x-twitter-active-user": "yes",
+        "x-twitter-client-language": "zh-cn",
+        "content-type": "application/json",
+    }
+    if extra_headers:
+        headers.update(extra_headers)
     return httpx.Client(
         timeout=30,
         follow_redirects=True,
         proxy=proxy,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/125.0.0.0 Safari/537.36"
-            ),
-            "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8",
-            "Accept": "application/json, text/plain, */*",
-            "Referer": "https://x.com/",
-            "Origin": "https://x.com",
-            "Sec-Fetch-Dest": "empty",
-            "Sec-Fetch-Mode": "cors",
-            "Sec-Fetch-Site": "same-origin",
-            "x-twitter-active-user": "yes",
-            "x-twitter-client-language": "zh-cn",
-        },
+        headers=headers,
     )
 
 
-def _load_cookies(client: httpx.Client) -> bool:
+def _load_cookies(client: httpx.Client) -> Optional[str]:
     """
     从文件和环境变量加载 cookies。
     GitHub Actions 下通过 X_COOKIES 环境变量注入；
     本地运行通过 COOKIES_FILE 文件加载。
-    返回 True 表示成功加载。
+    返回 ct0 的值（用于 CSRF token），如果没找到返回 None。
     """
+    cookie_list = None
+
     # 方式1：环境变量（GitHub Secrets，优先级高）
     env_cookies = os.getenv("X_COOKIES", "")
     if env_cookies:
         try:
             cookie_list = json.loads(env_cookies)
-            for c in cookie_list:
-                client.cookies.set(c["name"], c["value"], domain=c.get("domain", ""))
             log(f"从环境变量加载了 {len(cookie_list)} 个 cookies")
-            return True
         except json.JSONDecodeError:
             log("X_COOKIES 环境变量 JSON 格式错误，尝试文件加载", "WARN")
 
     # 方式2：本地 cookies 文件
-    if COOKIES_FILE.exists():
+    if cookie_list is None and COOKIES_FILE.exists():
         try:
             cookie_list = json.loads(COOKIES_FILE.read_text(encoding="utf-8"))
-            for c in cookie_list:
-                client.cookies.set(c["name"], c["value"], domain=c.get("domain", ""))
             log(f"从文件加载了 {len(cookie_list)} 个 cookies: {COOKIES_FILE}")
-            return True
         except (json.JSONDecodeError, KeyError):
             log(f"Cookies 文件格式错误: {COOKIES_FILE}", "ERROR")
-            return False
+            return None
 
-    log("未找到 cookies（环境变量 X_COOKIES 和文件 x_cookies.json 均不存在）", "WARN")
-    return False
+    if cookie_list is None:
+        log("未找到 cookies（环境变量 X_COOKIES 和文件 x_cookies.json 均不存在）", "WARN")
+        return None
+
+    ct0_value = None
+    for c in cookie_list:
+        client.cookies.set(c["name"], c["value"], domain=c.get("domain", ""))
+        if c["name"] == "ct0":
+            ct0_value = c["value"]
+
+    if ct0_value:
+        log(f"已加载 {len(cookie_list)} 个 cookies (含 CSRF token)")
+    else:
+        log(f"已加载 {len(cookie_list)} 个 cookies (⚠️ 缺少 ct0/CSRF token)")
+    return ct0_value
 
 
 def _parse_tweets_from_api(response_data: dict) -> list[dict]:
@@ -289,17 +306,21 @@ def _parse_tweets_from_api(response_data: dict) -> list[dict]:
     return tweets
 
 
-def _get_user_id(client: httpx.Client, screen_name: str) -> Optional[str]:
+def _get_user_id(client: httpx.Client, screen_name: str, csrf_token: str = "") -> Optional[str]:
     """通过用户名获取 X 用户 ID（rest_id）"""
     variables = json.dumps({"screen_name": screen_name, "withSafetyModeUserFields": True})
     features = json.dumps(X_FEATURES)
     params = {"variables": variables, "features": features}
+    headers = {}
+    if csrf_token:
+        headers["x-csrf-token"] = csrf_token
 
     try:
         resp = client.get(
             "https://x.com/i/api/graphql/"
             f"{USER_BY_SCREEN_NAME_QUERY_ID}/UserByScreenName",
             params=params,
+            headers=headers,
         )
         debug(f"UserByScreenName 响应状态: {resp.status_code}")
         if resp.status_code != 200:
@@ -332,11 +353,11 @@ def fetch_tweets(
     log(f"开始抓取 @{screen_name} 的最新推文...")
 
     with _build_client() as client:
-        # 1. 加载 cookies
-        has_cookies = _load_cookies(client)
+        # 1. 加载 cookies，获取 CSRF token
+        csrf_token = _load_cookies(client)
 
         # 2. 先访问首页获取 guest token（如果没有 cookies）
-        if not has_cookies:
+        if not csrf_token:
             log("尝试以访客模式访问...")
             try:
                 # 获取 guest_id cookie（X 会为访客自动设置）
@@ -346,7 +367,7 @@ def fetch_tweets(
                 log(f"访问 X 首页失败: {e}", "ERROR")
 
         # 3. 获取用户 ID
-        user_id = _get_user_id(client, screen_name)
+        user_id = _get_user_id(client, screen_name, csrf_token or "")
         if not user_id:
             log("无法获取用户 ID，请检查用户名或 cookies 是否有效", "ERROR")
             return []
@@ -362,6 +383,9 @@ def fetch_tweets(
         })
         features = json.dumps(X_FEATURES)
         field_toggles = json.dumps({"withArticlePlainText": False})
+        api_headers = {}
+        if csrf_token:
+            api_headers["x-csrf-token"] = csrf_token
 
         try:
             resp = client.get(
@@ -372,6 +396,7 @@ def fetch_tweets(
                     "features": features,
                     "fieldToggles": field_toggles,
                 },
+                headers=api_headers,
             )
             debug(f"UserTweets 响应状态: {resp.status_code}")
 
