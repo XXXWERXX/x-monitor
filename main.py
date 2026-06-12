@@ -61,7 +61,7 @@ TARGET_SCREEN_NAME = os.getenv("TARGET_SCREEN_NAME", "elonmusk")
 MAX_TWEETS_FETCH = 5  # 每次只抓最新5条（减少页面处理时间）
 
 SMTP_SERVER = os.getenv("SMTP_SERVER", "smtp.qq.com")
-SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
+SMTP_PORT = int(os.getenv("SMTP_PORT", "587"))  # 587 在 GitHub Actions 上更稳定
 SENDER_EMAIL = os.getenv("SENDER_EMAIL", "")
 SENDER_PASSWORD = os.getenv("SENDER_PASSWORD", "")
 RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL", "")
