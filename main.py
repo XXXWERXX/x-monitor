@@ -150,31 +150,13 @@ def refine_text(text: str) -> str:
     return text
 
 
-def summarize(text_cn: str) -> str:
-    """
-    从翻译结果中提取关键信息。
-    简单策略: 取前几句作为核心内容。
-    """
-    if not text_cn:
-        return ""
-    # 按句号/感叹号/问号分句
-    sentences = re.split(r'[。！？!?\n]', text_cn)
-    key_sentences = [s.strip() for s in sentences if len(s.strip()) > 3]
-    if not key_sentences:
-        return text_cn[:200]
-    # 取前2-3句
-    return "。".join(key_sentences[:3]) + "。"
-
-
 def analyze_tweet(text_en: str) -> dict:
-    """完整分析: 原文清理 → 翻译 → 精炼"""
+    """原文清理 → 翻译"""
     cleaned = refine_text(text_en)
     translated = translate_en_to_cn(cleaned) if cleaned else ""
-    key_point = summarize(translated) if translated else ""
     return {
         "cleaned": cleaned,
         "translated": translated,
-        "key_point": key_point,
     }
 
 
@@ -426,9 +408,7 @@ def send_email(subject: str, html_body: str) -> bool:
 def build_single_tweet_email(tweet: dict, analysis: dict, target: str) -> str:
     """为单条最新推文构建邮件"""
     text_en = tweet.get("full_text", "")
-    cleaned = analysis.get("cleaned", "")
     translated = analysis.get("translated", "")
-    key_point = analysis.get("key_point", "")
 
     # 时间格式化
     created_str = tweet.get("created_at", "")
@@ -473,13 +453,6 @@ def build_single_tweet_email(tweet: dict, analysis: dict, target: str) -> str:
     <div style="font-size:15px;line-height:1.7;color:#0f1419;white-space:pre-wrap;">{_escape(translated)}</div>
   </div>"""
 
-    if key_point and key_point != translated:
-        html += f"""
-  <!-- 精炼要点 -->
-  <div style="background:#fffbeb;padding:20px 24px;border-left:3px solid #f59e0b;border-right:1px solid #e1e8ed;">
-    <div style="margin-bottom:6px;font-size:11px;font-weight:600;color:#b45309;text-transform:uppercase;letter-spacing:1px;">💡 核心要点</div>
-    <div style="font-size:14px;line-height:1.7;color:#78350f;">{_escape(key_point)}</div>
-  </div>"""
 
     html += f"""
   <!-- 底部 -->
@@ -591,7 +564,6 @@ def main():
         result = analyze_tweet(test_text)
         print(f"清理: {result['cleaned']}")
         print(f"翻译: {result['translated']}")
-        print(f"精炼: {result['key_point']}")
         return
 
     if args.test_email:
