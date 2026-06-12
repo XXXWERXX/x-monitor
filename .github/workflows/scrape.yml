@@ -63,7 +63,7 @@ jobs:
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           # 先拉取最新，避免冲突
           git pull --rebase origin main
-          git add monitor_state.json 2>/dev/null || true
+          git add -f monitor_state.json 2>/dev/null || true
           if git diff --staged --quiet; then
             echo "无变化，跳过提交"
           else

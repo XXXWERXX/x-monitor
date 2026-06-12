@@ -6,9 +6,10 @@ __pycache__/
 *.pyc
 .venv/
 
-# 运行时状态文件
+# 运行时状态文件（不提交，防止覆盖 bot 的状态）
 sent_tweets.json
 last_tweets.json
+monitor_state.json
 x_cookies.json
 
 # IDE
