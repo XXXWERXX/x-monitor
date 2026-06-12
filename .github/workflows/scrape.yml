@@ -1,10 +1,11 @@
 name: X-Tweet-Monitor
 
 on:
-  schedule:
-    # 每5分钟（公开仓库无限额度）
-    - cron: '*/5 * * * *'
+  # 外部 cron-job.org 每5分钟精确触发
+  repository_dispatch:
+    types: [check-tweets]
 
+  # 也允许手动触发
   workflow_dispatch:
     inputs:
       target:
