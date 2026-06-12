@@ -2,11 +2,9 @@ name: X-Tweet-Monitor
 
 on:
   schedule:
-    # 每10分钟运行一次（最快安全频率）
-    # 每次约 20 秒，每天144次 ≈ 720分钟/月，在免费额度内
-    - cron: '*/10 * * * *'
+    # 每5分钟（公开仓库无限额度）
+    - cron: '*/5 * * * *'
 
-  # 允许手动触发（用于测试）
   workflow_dispatch:
     inputs:
       target:
@@ -17,9 +15,11 @@ on:
 jobs:
   monitor:
     runs-on: ubuntu-latest
-    timeout-minutes: 15  # Playwright 需要更多时间
+    timeout-minutes: 12
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+      # Playwright 浏览器缓存路径
+      PLAYWRIGHT_BROWSERS_PATH: ${{ github.workspace }}/.playwright-cache
 
     steps:
       - name: 检出代码
@@ -30,6 +30,14 @@ jobs:
         with:
           python-version: '3.12'
           cache: 'pip'
+
+      - name: 缓存 Playwright 浏览器
+        uses: actions/cache@v4
+        with:
+          path: .playwright-cache
+          key: playwright-${{ runner.os }}-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            playwright-${{ runner.os }}-
 
       - name: 安装依赖
         run: |
@@ -47,16 +55,16 @@ jobs:
           VERBOSE: "0"
         run: python main.py
 
-      - name: 提交更新的状态文件
+      - name: 提交状态更新
         if: success()
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add sent_tweets.json last_tweets.json 2>/dev/null || true
-          git diff --staged --quiet || git commit -m "📝 更新推文状态 [skip ci]"
+          git add monitor_state.json 2>/dev/null || true
+          git diff --staged --quiet || git commit -m "[skip ci] 更新监控状态"
           git push || true
 
-      - name: ⚠️ 运行失败通知
+      - name: ⚠️ 失败通知
         if: failure()
         env:
           SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
@@ -64,8 +72,20 @@ jobs:
           RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
         run: |
           python -c "
-          import os, sys
-          sys.path.insert(0, '.')
-          from main import send_error_notification
-          send_error_notification('GitHub Actions 运行失败，请检查仓库 Actions 日志。')
+          import smtplib, os, re
+          from email.mime.multipart import MIMEMultipart
+          from email.mime.text import MIMEText
+          from datetime import datetime
+          sender = os.environ['SENDER_EMAIL']
+          pwd = os.environ['SENDER_PASSWORD']
+          rcpt = os.environ['RECIPIENT_EMAIL']
+          msg = MIMEMultipart('alternative')
+          msg['Subject'] = f'[X监控] 运行失败 - {datetime.now().strftime(\"%Y-%m-%d %H:%M\")}'
+          msg['From'] = sender
+          msg['To'] = rcpt
+          msg.attach(MIMEText('GitHub Actions 运行失败，请检查 Actions 日志。', 'plain', 'utf-8'))
+          with smtplib.SMTP_SSL('smtp.qq.com', 465, timeout=30) as s:
+              s.login(sender, pwd)
+              s.send_message(msg)
+          print('错误通知已发送')
           "
