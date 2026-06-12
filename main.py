@@ -18,6 +18,7 @@ import os
 import re
 import smtplib
 import sys
+import time
 import traceback
 from datetime import datetime, timezone, timedelta
 from email.mime.multipart import MIMEMultipart
@@ -469,17 +470,14 @@ def _b64encode(s: str) -> str:
     return base64.b64encode(s.encode("utf-8")).decode("ascii")
 
 
-def find_newest_new_tweet(tweets: list[dict]) -> Optional[dict]:
-    """对比状态，找到最新的新推文"""
+def find_newest_new_tweet(tweets: list[dict], state: dict) -> Optional[dict]:
+    """对比状态，找到最新的新推文（接收已加载的 state，避免重复 API 调用）"""
     if not tweets:
         return None
 
-    state = load_state()
     last_id = state.get("last_tweet_id", "")
-
     sorted_tweets = sorted(tweets, key=lambda t: t.get("created_at", ""), reverse=True)
     newest = sorted_tweets[0]
-
     current_id = newest.get("id", "")
 
     if current_id == last_id:
@@ -516,21 +514,27 @@ def send_email(subject: str, html_body: str) -> bool:
     msg.attach(MIMEText(re.sub(r"<[^>]+>", "", html_body).strip(), "plain", "utf-8"))
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
-    try:
-        if SMTP_PORT == 465:
-            with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, timeout=30) as s:
-                s.login(sender, password)
-                s.send_message(msg)
-        else:
-            with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=30) as s:
-                s.ehlo(); s.starttls(); s.ehlo()
-                s.login(sender, password)
-                s.send_message(msg)
-        log(f"邮件已发送 -> {', '.join(recipients)}")
-        return True
-    except Exception as e:
-        log(f"邮件失败: {e}", "ERROR")
-        return False
+    for attempt in range(1, 4):
+        try:
+            if SMTP_PORT == 465:
+                with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, timeout=30) as s:
+                    s.login(sender, password)
+                    s.send_message(msg)
+            else:
+                with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=30) as s:
+                    s.ehlo(); s.starttls(); s.ehlo()
+                    s.login(sender, password)
+                    s.send_message(msg)
+            log(f"邮件已发送 -> {', '.join(recipients)}")
+            return True
+        except Exception as e:
+            if attempt < 3:
+                log(f"邮件失败(尝试{attempt}/3): {e}, 3秒后重试...", "WARN")
+                time.sleep(3)
+            else:
+                log(f"邮件失败(已重试3次): {e}", "ERROR")
+                return False
+    return False
 
 
 # ══════════════════════════════════════════════
@@ -635,7 +639,7 @@ def check_and_notify() -> dict:
     state_sha = state.get("sha", "")
 
     # 3. 找最新一条新推文
-    newest = find_newest_new_tweet(tweets)
+    newest = find_newest_new_tweet(tweets, state)
 
     if not newest:
         return summary
