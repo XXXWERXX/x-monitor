@@ -95,8 +95,59 @@ def now_beijing_iso() -> str:
     return datetime.now(TZ_BEIJING).isoformat()
 
 
+DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
+
 # ══════════════════════════════════════════════
-#  翻译 & 精炼
+#  翻译 & DeepSeek AI 解读
+# ══════════════════════════════════════════════
+
+def deepseek_analyze(text_en: str) -> str:
+    """
+    调用 DeepSeek API（R1 深度思考模型）解读推文。
+    返回一句话中文总结（只取最终结论，丢弃推理过程）。
+    """
+    if not DEEPSEEK_API_KEY:
+        return ""
+
+    prompt = (
+        "你是一位资深分析师。请深度思考以下英文推文的含义、背景和意图，"
+        "然后用一句中文精炼概括核心信息。只输出这一句话，不要任何解释。\n\n"
+        f"推文内容:\n{text_en}"
+    )
+
+    try:
+        resp = requests.post(
+            "https://api.deepseek.com/v1/chat/completions",
+            json={
+                "model": "deepseek-reasoner",
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": 500,
+                "temperature": 0.7,
+            },
+            headers={
+                "Authorization": f"Bearer {DEEPSEEK_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            timeout=30,
+        )
+        if resp.status_code == 200:
+            data = resp.json()
+            content = (
+                data.get("choices", [{}])[0]
+                .get("message", {})
+                .get("content", "")
+            )
+            return content.strip()
+        else:
+            log(f"DeepSeek API HTTP {resp.status_code}: {resp.text[:200]}", "WARN")
+            return ""
+    except Exception as e:
+        log(f"DeepSeek API 失败: {e}", "WARN")
+        return ""
+
+
+# ══════════════════════════════════════════════
+#  翻译
 # ══════════════════════════════════════════════
 
 def translate_en_to_cn(text: str) -> str:
@@ -151,12 +202,14 @@ def refine_text(text: str) -> str:
 
 
 def analyze_tweet(text_en: str) -> dict:
-    """原文清理 → 翻译"""
+    """原文清理 → 翻译 → DeepSeek 深度解读"""
     cleaned = refine_text(text_en)
     translated = translate_en_to_cn(cleaned) if cleaned else ""
+    deepseek_summary = deepseek_analyze(cleaned) if cleaned and DEEPSEEK_API_KEY else ""
     return {
         "cleaned": cleaned,
         "translated": translated,
+        "deepseek_summary": deepseek_summary,
     }
 
 
@@ -532,6 +585,14 @@ def build_single_tweet_email(tweet: dict, analysis: dict, target: str) -> str:
     <div style="font-size:15px;line-height:1.7;color:#0f1419;white-space:pre-wrap;">{_escape(translated)}</div>
   </div>"""
 
+    ai_summary = analysis.get("deepseek_summary", "")
+    if ai_summary:
+        html += f"""
+  <!-- AI 深度解读 -->
+  <div style="background:linear-gradient(135deg,#f0f7ff,#e8f4fd);padding:20px 24px;border-left:3px solid #6c5ce7;border-right:1px solid #e1e8ed;">
+    <div style="margin-bottom:6px;font-size:11px;font-weight:600;color:#6c5ce7;text-transform:uppercase;letter-spacing:1px;">🤖 DeepSeek 深度解读</div>
+    <div style="font-size:15px;line-height:1.7;color:#2d1956;font-weight:500;white-space:pre-wrap;">{_escape(ai_summary)}</div>
+  </div>"""
 
     html += f"""
   <!-- 底部 -->
