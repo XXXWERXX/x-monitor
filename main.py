@@ -514,26 +514,30 @@ def send_email(subject: str, html_body: str) -> bool:
     msg.attach(MIMEText(re.sub(r"<[^>]+>", "", html_body).strip(), "plain", "utf-8"))
     msg.attach(MIMEText(html_body, "html", "utf-8"))
 
-    for attempt in range(1, 4):
-        try:
-            if SMTP_PORT == 465:
-                with smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT, timeout=30) as s:
-                    s.login(sender, password)
-                    s.send_message(msg)
-            else:
-                with smtplib.SMTP(SMTP_SERVER, SMTP_PORT, timeout=30) as s:
-                    s.ehlo(); s.starttls(); s.ehlo()
-                    s.login(sender, password)
-                    s.send_message(msg)
-            log(f"邮件已发送 -> {', '.join(recipients)}")
-            return True
-        except Exception as e:
-            if attempt < 3:
-                log(f"邮件失败(尝试{attempt}/3): {e}, 3秒后重试...", "WARN")
-                time.sleep(3)
-            else:
-                log(f"邮件失败(已重试3次): {e}", "ERROR")
-                return False
+    # 双端口 fallback: 587 STARTTLS → 465 SSL
+    port_attempts = [(587, "STARTTLS"), (465, "SSL")] if SMTP_PORT == 587 else [(465, "SSL"), (587, "STARTTLS")]
+
+    for port, desc in port_attempts:
+        for attempt in range(1, 3):
+            try:
+                log(f"尝试 {desc}:{port} (第{attempt}次)")
+                if port == 465:
+                    with smtplib.SMTP_SSL(SMTP_SERVER, port, timeout=30) as s:
+                        s.login(sender, password)
+                        s.send_message(msg)
+                else:
+                    with smtplib.SMTP(SMTP_SERVER, port, timeout=30) as s:
+                        s.ehlo(); s.starttls(); s.ehlo()
+                        s.login(sender, password)
+                        s.send_message(msg)
+                log(f"邮件已发送 -> {', '.join(recipients)}")
+                return True
+            except Exception as e:
+                log(f"{desc}:{port} 失败: {e}", "WARN")
+                if attempt < 2:
+                    time.sleep(3)
+
+    log("所有端口和重试均失败", "ERROR")
     return False
 
 
