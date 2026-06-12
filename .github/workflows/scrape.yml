@@ -17,6 +17,8 @@ jobs:
   monitor:
     runs-on: ubuntu-latest
     timeout-minutes: 12
+    permissions:
+      contents: write  # 允许 API 更新文件
     env:
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
       # Playwright 浏览器缓存路径
@@ -53,29 +55,10 @@ jobs:
           SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
           RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
           X_COOKIES: ${{ secrets.X_COOKIES }}
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
           VERBOSE: "0"
         run: python main.py
-
-      - name: 提交状态更新
-        if: success()
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          # 先拉取最新，避免冲突
-          git pull --rebase origin main
-          git add -f monitor_state.json 2>/dev/null || true
-          if git diff --staged --quiet; then
-            echo "无变化，跳过提交"
-          else
-            git commit -m "[skip ci] 更新监控状态"
-            # 重试3次 push，防止竞态
-            for i in 1 2 3; do
-              git push origin main && break
-              echo "push 失败，重试 $i..."
-              git pull --rebase origin main
-              sleep 2
-            done
-          fi
 
       - name: ⚠️ 失败通知
         if: failure()

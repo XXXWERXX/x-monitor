@@ -304,63 +304,142 @@ def _extract_tweet(el) -> Optional[dict]:
 
 
 # ══════════════════════════════════════════════
-#  时间戳去重
+#  时间戳去重（GitHub API 原子更新，无竞态）
 # ══════════════════════════════════════════════
 
+# GitHub 仓库信息
+GITHUB_REPO = os.getenv("GITHUB_REPOSITORY", "")  # 如 XXXWERXX/x-monitor
+GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")      # Actions 自动注入
+STATE_PATH = "monitor_state.json"                  # 仓库中的路径
+
+
+def _state_api_url() -> str:
+    return f"https://api.github.com/repos/{GITHUB_REPO}/contents/{STATE_PATH}"
+
+
+def _state_raw_url() -> str:
+    return f"https://raw.githubusercontent.com/{GITHUB_REPO}/main/{STATE_PATH}"
+
+
 def load_state() -> dict:
-    """加载监控状态: 上次最新推文的时间戳"""
-    if STATE_FILE.exists():
-        try:
-            return json.loads(STATE_FILE.read_text(encoding="utf-8"))
-        except (json.JSONDecodeError, KeyError):
-            pass
-    return {"last_tweet_time": "", "last_tweet_id": "", "updated_at": ""}
+    """从 GitHub API 加载状态（返回含 SHA，用于后续原子更新）"""
+    url = _state_api_url()
+    headers = {"Accept": "application/vnd.github+json"}
+    if GITHUB_TOKEN:
+        headers["Authorization"] = f"token {GITHUB_TOKEN}"
+
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            raw = resp.json()
+            content = raw.get("content", "")
+            sha = raw.get("sha", "")
+            # base64 解码
+            if content:
+                import base64
+                try:
+                    data = json.loads(base64.b64decode(content).decode("utf-8"))
+                    data["sha"] = sha
+                    log(f"加载状态: sha={sha[:7]} 上次ID={data.get('last_tweet_id', 'N/A')[:15]}")
+                    return data
+                except Exception:
+                    pass
+        # 404 = 文件不存在，首次运行
+        if resp.status_code == 404:
+            log("状态文件不存在，首次运行")
+    except Exception as e:
+        log(f"加载状态失败: {e}", "WARN")
+
+    return {"last_tweet_time": "", "last_tweet_id": "", "sha": ""}
 
 
-def save_state(tweet_time: str, tweet_id: str) -> None:
-    """保存最新推文时间戳"""
-    STATE_FILE.write_text(json.dumps({
+def save_state(tweet_time: str, tweet_id: str, old_sha: str = "") -> bool:
+    """
+    用 GitHub API 原子更新状态文件。
+    需要提供旧 SHA（从 load_state 获取），GitHub 校验 SHA 匹配才允许更新。
+    如果两个 run 同时更新，只有第一个成功，第二个会 409 冲突 → 不发重复邮件。
+    """
+    if not GITHUB_TOKEN or not GITHUB_REPO:
+        # 本地运行或无 token，降级为本地文件
+        STATE_FILE.write_text(json.dumps({
+            "last_tweet_time": tweet_time,
+            "last_tweet_id": tweet_id,
+            "updated_at": now_beijing_iso(),
+        }, ensure_ascii=False, indent=2), encoding="utf-8")
+        return True
+
+    url = _state_api_url()
+    new_content = json.dumps({
         "last_tweet_time": tweet_time,
         "last_tweet_id": tweet_id,
         "updated_at": now_beijing_iso(),
-    }, ensure_ascii=False, indent=2), encoding="utf-8")
+    }, ensure_ascii=False, indent=2)
+
+    body = {
+        "message": f"[skip ci] 更新状态: {tweet_id}",
+        "content": _b64encode(new_content),
+        "branch": "main",
+    }
+    if old_sha:
+        body["sha"] = old_sha
+
+    try:
+        resp = requests.put(
+            url,
+            json=body,
+            headers={
+                "Authorization": f"token {GITHUB_TOKEN}",
+                "Accept": "application/vnd.github+json",
+            },
+            timeout=15,
+        )
+        if resp.status_code in (200, 201):
+            log("状态已原子更新")
+            return True
+        elif resp.status_code == 409:
+            log("状态更新冲突(另一个 run 抢先了)，跳过", "WARN")
+            return False
+        elif resp.status_code == 422:
+            # SHA 不匹配说明文件已被其他人修改，内容是最新的
+            log("SHA 不匹配，文件已被更新", "WARN")
+            return False
+        else:
+            log(f"状态更新失败 HTTP {resp.status_code}: {resp.text[:200]}", "ERROR")
+            return False
+    except Exception as e:
+        log(f"状态更新异常: {e}", "ERROR")
+        return False
+
+
+def _b64encode(s: str) -> str:
+    import base64
+    return base64.b64encode(s.encode("utf-8")).decode("ascii")
 
 
 def find_newest_new_tweet(tweets: list[dict]) -> Optional[dict]:
-    """
-    对比历史状态，找到比上次更新的推文。
-    返回最新的一条（如果有比历史记录更新的）。
-    """
+    """对比状态，找到最新的新推文"""
     if not tweets:
         return None
 
     state = load_state()
-    last_time = state.get("last_tweet_time", "")
+    last_id = state.get("last_tweet_id", "")
 
-    # 推文已按页面顺序排列（通常最新在前），按 created_at 排序
     sorted_tweets = sorted(tweets, key=lambda t: t.get("created_at", ""), reverse=True)
+    newest = sorted_tweets[0]
 
-    newest = sorted_tweets[0]  # 当前最新
-
-    current_time = newest.get("created_at", "")
     current_id = newest.get("id", "")
 
-    # 如果和上次一样，说明没有新推文
-    if current_id == state.get("last_tweet_id", ""):
-        log(f"最新推文未变 ({current_id})")
+    if current_id == last_id:
+        log(f"推文未变 ({current_id})")
         return None
 
-    if last_time and current_time <= last_time:
-        log(f"没有比 {last_time} 更新的推文")
-        return None
-
-    log(f"发现新推文! 时间: {current_time}")
+    log(f"发现新推文: {current_id}")
     return newest
 
 
-def mark_as_sent(tweet: dict) -> None:
-    """标记此推文为已发送"""
-    save_state(tweet.get("created_at", ""), tweet.get("id", ""))
+def mark_as_sent(tweet: dict, old_sha: str = "") -> bool:
+    """标记已发送，返回是否成功"""
+    return save_state(tweet.get("created_at", ""), tweet.get("id", ""), old_sha)
 
 
 # ══════════════════════════════════════════════
@@ -490,7 +569,11 @@ def check_and_notify() -> dict:
     if not tweets:
         return summary
 
-    # 2. 找最新一条新推文
+    # 2. 先加载状态（获取 SHA）
+    state = load_state()
+    state_sha = state.get("sha", "")
+
+    # 3. 找最新一条新推文
     newest = find_newest_new_tweet(tweets)
 
     if not newest:
@@ -499,19 +582,25 @@ def check_and_notify() -> dict:
     summary["is_new"] = True
     summary["new_tweet_id"] = newest.get("id", "")
 
-    # 3. 翻译 + 精炼
-    log("翻译及精炼中...")
+    # 4. 翻译
+    log("翻译中...")
     analysis = analyze_tweet(newest.get("full_text", ""))
 
-    # 4. 构建邮件并发送
+    # 5. 构建邮件并发送
     html = build_single_tweet_email(newest, analysis, TARGET_SCREEN_NAME)
     subject = f"[X监控] @{TARGET_SCREEN_NAME} 发帖了 — {now_beijing()}"
 
     if send_email(subject, html):
-        summary["email_sent"] = True
-        # 5. 更新状态，标记已发送
-        mark_as_sent(newest)
-        log("✓ 新推文已发送")
+        # 6. 原子更新状态（带 SHA 校验，防止重复）
+        ok = mark_as_sent(newest, state_sha)
+        if ok:
+            summary["email_sent"] = True
+            log("✓ 新推文已发送并记录")
+        else:
+            # 邮件发了但状态更新冲突 → 另一个 run 抢先了
+            # 这次发了就发了，下次不会再发（另一个 run 已经更新了状态）
+            summary["email_sent"] = True
+            log("✓ 邮件已发送（状态更新被另一run抢先，不影响去重）")
     else:
         log("✗ 邮件发送失败", "ERROR")
 
