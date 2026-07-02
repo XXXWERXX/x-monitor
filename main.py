@@ -296,6 +296,17 @@ def fetch_tweets(screen_name: str) -> list[dict]:
             # 只取前几个推文元素（页面按时间倒序排列）
             elements = page.query_selector_all('[data-testid="tweet"]')[:MAX_TWEETS_FETCH]
 
+            # ── 展开被截断的长推文（点击 "Show more"）──
+            for el in elements:
+                try:
+                    show_more = el.query_selector('xpath=.//span[text()="Show more"]')
+                    if show_more:
+                        show_more.click()
+                        page.wait_for_timeout(500)  # 等文本展开
+                        debug("已展开一条长推文")
+                except Exception:
+                    pass  # 点击失败不影响后续提取
+
             for el in elements:
                 t = _extract_tweet(el)
                 if t:
